@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Dict, Optional
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 DB_PATH = "trimming_schedule.db"
@@ -169,6 +170,25 @@ def init_db():
         conn.commit()
 
 
+def inject_compact_css():
+    st.markdown(
+        """
+        <style>
+        h1 {font-size: 1.45rem !important; margin: 0.1rem 0 0.5rem 0 !important;}
+        h2 {font-size: 1.15rem !important; margin: 0.2rem 0 0.4rem 0 !important;}
+        h3 {font-size: 1.0rem !important; margin: 0.15rem 0 0.35rem 0 !important;}
+        .block-container {padding-top: 0.6rem !important; padding-bottom: 0.6rem !important;}
+        div[data-testid="stVerticalBlock"] > div:has(> div > .stRadio) {padding-top: 0.2rem !important; padding-bottom: 0.2rem !important;}
+        div[data-testid="stHorizontalBlock"] {gap: 0.45rem !important;}
+        div[data-testid="stForm"] {padding: 0.45rem 0.55rem !important;}
+        .stAlert {padding: 0.3rem 0.55rem !important; margin-top: 0.15rem !important; margin-bottom: 0.2rem !important;}
+        p {margin-bottom: 0.25rem !important;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def parse_hhmm(v: str) -> time:
     return datetime.strptime(v, "%H:%M").time()
 
@@ -248,9 +268,9 @@ def recompute_booking(conn, booking_id: int):
 
     menu_auto = menu_price(conn, b["menu_type"], b["body_size"], b["coat_type"])
     menu_snapshot = b["menu_unit_price_excl_tax"] if b["menu_unit_price_excl_tax"] is not None else menu_auto
-
     subtotal_auto = menu_snapshot + opt_price
     subtotal_excl = b["subtotal_excl_tax_manual_override"] if b["subtotal_excl_tax_manual_override"] is not None else subtotal_auto
+
     settings = get_settings(conn)
     tax = math.floor(subtotal_excl * settings["tax_rate_percent"] / 100)
     subtotal_incl = subtotal_excl + tax
@@ -305,52 +325,56 @@ def compute_day_simulation(conn, day: str):
         extra_gap = max(0, int(r["extra_gap_buffer_minutes"] or 0)) if not is_last else 0
         applied_buffer = base_part + extra_gap
 
-        fixed_end_with_buffer = fixed_end_work + timedelta(minutes=applied_buffer)
-
-        enriched.append({
-            "raw": r,
-            "work_minutes": work_minutes,
-            "fixed_start": fixed_start,
-            "fixed_end_work": fixed_end_work,
-            "fixed_end_with_buffer": fixed_end_with_buffer,
-            "applied_buffer": applied_buffer,
-            "base_buffer": base_part,
-            "extra_gap_used": extra_gap,
-            "is_last": is_last,
-        })
+        enriched.append(
+            {
+                "raw": r,
+                "work_minutes": work_minutes,
+                "fixed_start": fixed_start,
+                "fixed_end_work": fixed_end_work,
+                "fixed_end_with_buffer": fixed_end_work + timedelta(minutes=applied_buffer),
+                "applied_buffer": applied_buffer,
+                "base_buffer": base_part,
+                "extra_gap_used": extra_gap,
+                "is_last": is_last,
+            }
+        )
 
     previous_virtual_end = open_t
     chain_level = 0
     for i, e in enumerate(enriched):
-        e["virtual_start"] = max(e["fixed_start"], previous_virtual_end)
+        e["early_virtual_start"] = None
+        if i > 0:
+            prev_raw = enriched[i - 1]["raw"]
+            if prev_raw["actual_end_confirmed"] and prev_raw["actual_end_time"] and e["raw"]["early_arrival_confirmed"]:
+                actual_end = combine(day, prev_raw["actual_end_time"])
+                candidate_early = max(actual_end, datetime.now().replace(second=0, microsecond=0))
+                if candidate_early < e["fixed_start"]:
+                    e["early_virtual_start"] = candidate_early
+
+        virtual_base = previous_virtual_end
+        if e["early_virtual_start"] is not None:
+            virtual_base = max(virtual_base, e["early_virtual_start"])
+
+        e["virtual_start"] = max(e["fixed_start"], virtual_base)
         e["virtual_end_work"] = e["virtual_start"] + timedelta(minutes=e["work_minutes"])
         e["virtual_end_with_buffer"] = e["virtual_end_work"] + timedelta(minutes=e["applied_buffer"])
 
         intrusion = previous_virtual_end > e["fixed_start"]
         chain_level = chain_level + 1 if intrusion else 0
         e["warning"] = "RED" if chain_level >= 2 else ("YELLOW" if intrusion else "GREEN")
+        e["has_virtual_overlap"] = e["virtual_start"] > e["fixed_start"]
         previous_virtual_end = e["virtual_end_with_buffer"]
 
         if i < len(enriched) - 1:
             nxt = enriched[i + 1]
             gap = int((nxt["fixed_start"] - e["fixed_end_work"]).total_seconds() // 60)
-            max_extra = max(0, gap - base_buffer)
             e["gap_to_next"] = gap
-            e["max_extra_buffer"] = max_extra
+            e["max_extra_buffer"] = max(0, gap - base_buffer)
             e["extra_buffer_editable"] = gap > base_buffer
         else:
             e["gap_to_next"] = None
             e["max_extra_buffer"] = 0
             e["extra_buffer_editable"] = False
-
-        e["early_virtual_start"] = None
-        if i > 0:
-            prev_raw = enriched[i - 1]["raw"]
-            if prev_raw["actual_end_confirmed"] and prev_raw["actual_end_time"] and e["raw"]["early_arrival_confirmed"]:
-                actual_end = combine(day, prev_raw["actual_end_time"])
-                candidate = max(actual_end, datetime.now().replace(second=0, microsecond=0))
-                if candidate < e["fixed_start"]:
-                    e["early_virtual_start"] = candidate
 
     day_warning = "GREEN"
     if any(e["warning"] == "RED" for e in enriched):
@@ -360,8 +384,84 @@ def compute_day_simulation(conn, day: str):
 
     if enriched and enriched[-1]["virtual_end_with_buffer"] > close_t:
         day_warning = "RED"
+        enriched[-1]["warning"] = "RED"
 
     return enriched, day_warning
+
+
+def build_timeline_figure(sim, day_s: str, open_time: str, close_time: str):
+    segments = []
+    color_map = {
+        "GREEN_確定": "#2ca02c",
+        "YELLOW_確定": "#e6ac00",
+        "RED_確定": "#d62728",
+        "GREEN_バッファ": "#91cf91",
+        "YELLOW_バッファ": "#ffd76b",
+        "RED_バッファ": "#ff8c8c",
+        "GREEN_仮想": "#1f77b4",
+        "YELLOW_仮想": "#9467bd",
+        "RED_仮想": "#8c564b",
+    }
+
+    for idx, e in enumerate(sim, 1):
+        raw = e["raw"]
+        row_label = f"{idx}. #{raw['id']} {raw['customer_name']}/{raw['dog_name']}"
+        warn = e["warning"]
+        hover_base = f"顧客: {raw['customer_name']}<br>犬: {raw['dog_name']}<br>メニュー: {raw['menu_type']}<br>作業: {e['work_minutes']}分<br>警告: {warn}"
+
+        segments.append(
+            {
+                "row": row_label,
+                "start": e["fixed_start"],
+                "end": e["fixed_end_work"],
+                "kind": f"{warn}_確定",
+                "label": "確定枠",
+                "hover": hover_base + "<br>区分: 確定枠",
+            }
+        )
+
+        if e["applied_buffer"] > 0:
+            segments.append(
+                {
+                    "row": row_label,
+                    "start": e["fixed_end_work"],
+                    "end": e["fixed_end_with_buffer"],
+                    "kind": f"{warn}_バッファ",
+                    "label": f"バッファ({e['applied_buffer']}分)",
+                    "hover": hover_base + f"<br>区分: バッファ {e['applied_buffer']}分",
+                }
+            )
+
+        if e["has_virtual_overlap"]:
+            segments.append(
+                {
+                    "row": row_label,
+                    "start": e["virtual_start"],
+                    "end": e["virtual_end_work"],
+                    "kind": f"{warn}_仮想",
+                    "label": "仮想枠",
+                    "hover": hover_base + "<br>区分: 仮想枠（可視化のみ）",
+                }
+            )
+
+    if not segments:
+        return None
+
+    df = pd.DataFrame(segments)
+    fig = px.timeline(
+        df,
+        x_start="start",
+        x_end="end",
+        y="row",
+        color="kind",
+        color_discrete_map=color_map,
+        hover_name="label",
+        hover_data={"start": True, "end": True, "kind": False, "row": False, "hover": True},
+    )
+    fig.update_yaxes(autorange="reversed", title=None)
+    fig.update_xaxes(range=[combine(day_s, open_time), combine(day_s, close_time)], tickformat="%H:%M", title=None)
+    fig.update_layout(height=max(320, len(sim) * 64), margin=dict(l=5, r=5, t=8, b=8), legend_title_text="区分")
+    return fig
 
 
 def monthly_range(start_day: date):
@@ -401,9 +501,7 @@ def create_or_update_booking(conn, booking_id: Optional[int], payload: dict, opt
     save_booking_options(conn, booking_id, option_qty)
     recompute_booking(conn, booking_id)
 
-    new_status = payload["payment_status"]
-    if previous_status == "UNPAID" and new_status == "PAID":
-        # ポイント計算式は未確定のため、points_grantedを手動値/0で運用
+    if previous_status == "UNPAID" and payload["payment_status"] == "PAID":
         pass
     conn.commit()
 
@@ -415,11 +513,12 @@ def set_extra_gap_buffer(conn, booking_id: int, minutes: int):
 
 def main():
     st.set_page_config(page_title="トリミング スケジュール調整", layout="wide")
+    inject_compact_css()
     init_db()
     conn = get_conn()
 
     st.title("トリミングサロン スケジュール調整ツール")
-    left, mid, right = st.columns([1, 1.4, 1.6])
+    left, mid, right = st.columns([1, 1.4, 1.9])
 
     with left:
         st.subheader("設定")
@@ -433,9 +532,6 @@ def main():
             upsert_settings(conn, open_t, close_t, int(buffer_minutes), apply_last, int(tax_rate))
             conn.commit()
             st.success("保存しました")
-
-        st.markdown("---")
-        st.caption("メニュー時間/単価、オプションはSQLiteマスタで管理")
 
     with mid:
         st.subheader("予約")
@@ -469,13 +565,11 @@ def main():
             st.markdown("**会計**")
             menu_snap_default = "" if not current or current["menu_unit_price_excl_tax"] is None else str(current["menu_unit_price_excl_tax"])
             subtotal_override_default = "" if not current or current["subtotal_excl_tax_manual_override"] is None else str(current["subtotal_excl_tax_manual_override"])
-
             e1, e2, e3, e4 = st.columns(4)
             menu_price_snapshot_input = e1.text_input("メニュー税抜単価（任意上書き）", value=menu_snap_default, placeholder="空欄ならマスタ自動")
             manual_override_input = e2.text_input("税抜小計 手動上書き（任意）", value=subtotal_override_default, placeholder="空欄なら自動")
             discount = e3.number_input("割引(円)", min_value=0, value=current["discount_yen"] if current else 0)
             points_used = e4.number_input("ポイント使用(円)", min_value=0, value=current["points_used_yen"] if current else 0)
-
             pay1, pay2 = st.columns(2)
             payment_status = pay1.selectbox("支払状況", ["UNPAID", "PAID"], index=["UNPAID", "PAID"].index(current["payment_status"]) if current else 0)
             points_granted = pay2.number_input("付与ポイント", min_value=0, value=current["points_granted"] if current else 0)
@@ -495,16 +589,12 @@ def main():
                         key=f"opt_{o['id']}",
                     )
 
-            submitted = st.form_submit_button("保存")
-            if submitted:
+            if st.form_submit_button("保存"):
                 if not fixed_start:
                     st.error("固定開始時刻は必須です。")
                 else:
                     try:
                         parse_hhmm(fixed_start)
-                        menu_snapshot = parse_optional_int(menu_price_snapshot_input)
-                        manual_override = parse_optional_int(manual_override_input)
-
                         payload = {
                             "booking_date": b_date.strftime("%Y-%m-%d"),
                             "fixed_start_time": fixed_start,
@@ -518,8 +608,8 @@ def main():
                             "actual_end_time": actual_end_time or None,
                             "actual_end_confirmed": int(actual_confirm),
                             "early_arrival_confirmed": int(early),
-                            "menu_unit_price_excl_tax": menu_snapshot,
-                            "subtotal_excl_tax_manual_override": manual_override,
+                            "menu_unit_price_excl_tax": parse_optional_int(menu_price_snapshot_input),
+                            "subtotal_excl_tax_manual_override": parse_optional_int(manual_override_input),
                             "discount_yen": int(discount),
                             "points_used_yen": int(points_used),
                             "payment_status": payment_status,
@@ -545,34 +635,21 @@ def main():
             rows = []
             for d in monthly_range(date.today()):
                 d_s = d.strftime("%Y-%m-%d")
-                day_rows = fetch_bookings_for_day(conn, d_s)
                 sim, warn = compute_day_simulation(conn, d_s)
                 last = sim[-1]["virtual_end_with_buffer"].strftime("%H:%M") if sim else "-"
-                rows.append({"日付": d_s, "件数": len(day_rows), "最終終了見込み": last, "警告": warn})
+                rows.append({"日付": d_s, "件数": len(fetch_bookings_for_day(conn, d_s)), "最終終了見込み": last, "警告": warn})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
+            s = get_settings(conn)
             sim, day_warn = compute_day_simulation(conn, day_s)
             color = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}[day_warn]
-            st.markdown(f"### 当日警告: {color} {day_warn}")
+            st.markdown(f"**当日警告:** {color} {day_warn}")
 
-            timeline_rows = []
-            for e in sim:
-                raw = e["raw"]
-                timeline_rows.append(
-                    {
-                        "ID": raw["id"],
-                        "顧客": raw["customer_name"],
-                        "固定": f"{hhmm(e['fixed_start'])}-{hhmm(e['fixed_end_work'])}",
-                        "バッファ": f"+{e['applied_buffer']}分 (既定{e['base_buffer']}+余白{e['extra_gap_used']})",
-                        "仮想": f"{hhmm(e['virtual_start'])}-{hhmm(e['virtual_end_work'])}",
-                        "前倒し仮想開始": hhmm(e["early_virtual_start"]) if e["early_virtual_start"] else "-",
-                        "警告": e["warning"],
-                        "税抜(自動)": raw["subtotal_excl_tax_auto"],
-                        "税抜(手動上書き)": raw["subtotal_excl_tax_manual_override"] if raw["subtotal_excl_tax_manual_override"] is not None else "-",
-                        "支払額": raw["amount_due_yen"],
-                    }
-                )
-            st.dataframe(pd.DataFrame(timeline_rows), use_container_width=True, hide_index=True)
+            fig = build_timeline_figure(sim, day_s, s["business_open_time"], s["business_close_time"])
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("予約がありません。")
             st.caption("※消費税端数切捨")
 
             st.markdown("#### バッファ余白編集（空き時間 > 既定バッファ の区間のみ）")
@@ -583,14 +660,13 @@ def main():
                 if e["extra_buffer_editable"]:
                     current_extra = int(e["raw"]["extra_gap_buffer_minutes"] or 0)
                     default_extra = min(current_extra, e["max_extra_buffer"])
-                    key = f"extra_gap_{booking_id}"
                     value = st.number_input(
                         f"予約#{booking_id} の余白バッファ（上限 {e['max_extra_buffer']}分）",
                         min_value=0,
                         max_value=e["max_extra_buffer"],
                         value=default_extra,
                         step=5,
-                        key=key,
+                        key=f"extra_gap_{booking_id}",
                     )
                     if st.button(f"予約#{booking_id} の余白保存", key=f"save_extra_{booking_id}"):
                         set_extra_gap_buffer(conn, booking_id, int(value))
@@ -600,16 +676,14 @@ def main():
                     st.write(f"予約#{booking_id}: 編集不可（空き時間 {e['gap_to_next']}分 <= 既定バッファ）")
 
             st.markdown("#### 常時ヘルプ（提案のみ）")
-            if not sim:
-                st.write("予約がありません。")
-            else:
+            if sim:
                 if day_warn == "GREEN":
                     st.success("現時点で食い込みはありません。追加オプションは余白内で検討可能です。")
                 if any(e["warning"] == "YELLOW" for e in sim):
                     st.warning("黄警告: 単発食い込み。追加オプションを減らすか、次予約開始を手動調整してください。")
                 if any(e["warning"] == "RED" for e in sim):
                     st.error("赤警告: 連鎖波及または営業時間超過。手動で開始時刻再調整か当日追加の見直しが必要です。")
-                if any(r["subtotal_excl_tax_manual_override"] is not None for r in [x["raw"] for x in sim]):
+                if any(e["raw"]["subtotal_excl_tax_manual_override"] is not None for e in sim):
                     st.info("手動調整あり: 一部予約で税抜小計の手動上書きが適用されています。")
                 st.write("自動で開始時刻は変更されません。確定枠を維持し、必要時のみ手動編集してください。")
 
