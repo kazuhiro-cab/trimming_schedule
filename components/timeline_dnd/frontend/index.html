@@ -1,0 +1,75 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://unpkg.com/vis-timeline@latest/standalone/umd/vis-timeline-graph2d.min.js"></script>
+  <link href="https://unpkg.com/vis-timeline@latest/styles/vis-timeline-graph2d.min.css" rel="stylesheet" />
+  <script src="https://unpkg.com/streamlit-component-lib@2.0.0/dist/index.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; }
+    #timeline { height: 620px; border: 1px solid #ddd; border-radius: 6px; }
+    .confirmed.GREEN { background:#2ca02c; border-color:#2ca02c; color:#fff; }
+    .confirmed.YELLOW { background:#e6ac00; border-color:#e6ac00; color:#111; }
+    .confirmed.RED { background:#d62728; border-color:#d62728; color:#fff; }
+    .buffer { background:#b6e6b6; border-color:#7ac77a; }
+    .virtual { background:#8eb2e6; border-color:#5f8ccf; }
+  </style>
+</head>
+<body>
+  <div id="timeline"></div>
+  <script>
+    const Streamlit = window.Streamlit;
+    let timeline = null;
+
+    function render(event) {
+      const args = event.detail.args || {};
+      const rawItems = args.items || [];
+      const items = rawItems.map(it => ({
+        id: it.id,
+        content: it.content,
+        start: it.start,
+        end: it.end,
+        editable: {updateTime: !!it.editable, updateGroup: false, remove: false},
+        className: `${it.kind} ${it.warning}`,
+        booking_id: it.booking_id,
+        kind: it.kind,
+      }));
+
+      const ds = new vis.DataSet(items);
+      const options = {
+        stack: true,
+        start: args.start,
+        end: args.end,
+        editable: true,
+        zoomable: true,
+        horizontalScroll: true,
+        verticalScroll: true,
+        margin: { item: 8, axis: 4 },
+        onMove: function(item, callback) {
+          callback(item);
+          Streamlit.setComponentValue({
+            booking_id: item.booking_id,
+            item_id: item.id,
+            kind: item.kind,
+            new_start_iso: new Date(item.start).toISOString()
+          });
+        }
+      };
+
+      if (!timeline) {
+        timeline = new vis.Timeline(document.getElementById('timeline'), ds, options);
+      } else {
+        timeline.setItems(ds);
+        timeline.setOptions(options);
+      }
+
+      Streamlit.setFrameHeight(640);
+    }
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, render);
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(640);
+  </script>
+</body>
+</html>
