@@ -172,23 +172,16 @@ def init_db():
 
 def inject_compact_css():
     st.markdown("""
-<style>
-/* 全体の余白 */
-.block-container { padding-top: 1.0rem; padding-bottom: 1.0rem; }
-
-/* 見出しを小さく */
-h1 { font-size: 1.6rem !important; margin: 0.4rem 0 0.6rem 0 !important; }
-h2 { font-size: 1.2rem !important; margin: 0.4rem 0 0.4rem 0 !important; }
-h3 { font-size: 1.05rem !important; margin: 0.3rem 0 0.3rem 0 !important; }
-
-/* ウィジェット間の縦スペース */
-div[data-testid="stVerticalBlock"] > div { gap: 0.35rem; }
-div[data-testid="stForm"] { padding-top: 0.2rem; }
-
-/* ラジオ/チェックなどの余白 */
-label, .stRadio, .stCheckbox { margin-bottom: 0.1rem !important; }
-</style>
-""", unsafe_allow_html=True)
+    <style>
+    .block-container { padding-top: 0.8rem; padding-bottom: 0.8rem; }
+    h1 { font-size: 1.6rem !important; margin: 0.35rem 0 0.55rem 0 !important; }
+    h2 { font-size: 1.2rem !important; margin: 0.30rem 0 0.40rem 0 !important; }
+    h3 { font-size: 1.05rem !important; margin: 0.25rem 0 0.30rem 0 !important; }
+    div[data-testid="stVerticalBlock"] > div { gap: 0.35rem; }
+    div[data-testid="stForm"] { padding-top: 0.2rem; }
+    label, .stRadio, .stCheckbox { margin-bottom: 0.1rem !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
 
 def parse_hhmm(v: str) -> time:
