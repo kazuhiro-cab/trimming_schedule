@@ -1,9 +1,8 @@
 import math
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import pandas as pd
 import streamlit as st
@@ -54,7 +53,14 @@ DEFAULT_OPTIONS = [
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def ensure_column(conn, table: str, column: str, ddl: str):
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def init_db():
@@ -121,7 +127,8 @@ def init_db():
                 subtotal_incl_tax_yen INTEGER NOT NULL DEFAULT 0,
                 amount_due_yen INTEGER NOT NULL DEFAULT 0,
                 payment_status TEXT NOT NULL DEFAULT 'UNPAID',
-                points_granted INTEGER NOT NULL DEFAULT 0
+                points_granted INTEGER NOT NULL DEFAULT 0,
+                extra_gap_buffer_minutes INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS booking_options (
@@ -138,6 +145,7 @@ def init_db():
             """
         )
         cur.execute("INSERT OR IGNORE INTO settings(id) VALUES(1)")
+        ensure_column(conn, "bookings", "extra_gap_buffer_minutes", "extra_gap_buffer_minutes INTEGER NOT NULL DEFAULT 0")
 
         for (kind, body, coat), minutes in MENU_BASE_MINUTES.items():
             cur.execute(
@@ -173,6 +181,16 @@ def combine(d: str, t: str) -> datetime:
     return datetime.combine(datetime.strptime(d, "%Y-%m-%d").date(), parse_hhmm(t))
 
 
+def parse_optional_int(v: str) -> Optional[int]:
+    txt = (v or "").strip()
+    if not txt:
+        return None
+    n = int(txt)
+    if n < 0:
+        raise ValueError
+    return n
+
+
 def get_settings(conn):
     return conn.execute("SELECT * FROM settings WHERE id=1").fetchone()
 
@@ -186,7 +204,7 @@ def fetch_bookings_for_day(conn, day: str):
 
 
 def fetch_booking_options(conn, booking_id: int):
-    rows = conn.execute(
+    return conn.execute(
         """
         SELECT bo.*, om.option_name
         FROM booking_options bo
@@ -195,7 +213,6 @@ def fetch_booking_options(conn, booking_id: int):
         """,
         (booking_id,),
     ).fetchall()
-    return rows
 
 
 def base_menu_minutes(conn, menu_type: str, body: str, coat: str):
@@ -227,25 +244,26 @@ def menu_price(conn, menu_type: str, body: str, coat: str):
 def recompute_booking(conn, booking_id: int):
     b = conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
     options = fetch_booking_options(conn, booking_id)
-    opt_minutes = sum(r["minutes_total"] for r in options)
     opt_price = sum(r["price_excl_tax_total"] for r in options)
-    menu_minutes = base_menu_minutes(conn, b["menu_type"], b["body_size"], b["coat_type"])
-    add45 = 45 if b["shed_mat_flag"] and b["menu_type"] in ["C", "S", "CS"] else 0
-    work_minutes = menu_minutes + add45 + opt_minutes
-    menu_unit = b["menu_unit_price_excl_tax"] if b["menu_unit_price_excl_tax"] is not None else menu_price(conn, b["menu_type"], b["body_size"], b["coat_type"])
-    subtotal_auto = menu_unit + opt_price
+
+    menu_auto = menu_price(conn, b["menu_type"], b["body_size"], b["coat_type"])
+    menu_snapshot = b["menu_unit_price_excl_tax"] if b["menu_unit_price_excl_tax"] is not None else menu_auto
+
+    subtotal_auto = menu_snapshot + opt_price
     subtotal_excl = b["subtotal_excl_tax_manual_override"] if b["subtotal_excl_tax_manual_override"] is not None else subtotal_auto
     settings = get_settings(conn)
     tax = math.floor(subtotal_excl * settings["tax_rate_percent"] / 100)
     subtotal_incl = subtotal_excl + tax
     amount_due = max(0, subtotal_incl - (b["discount_yen"] or 0) - (b["points_used_yen"] or 0))
+
     conn.execute(
         """UPDATE bookings SET
+            menu_unit_price_excl_tax=?,
             options_unit_price_excl_tax_total=?,
             subtotal_excl_tax_auto=?,
             tax_yen=?, subtotal_incl_tax_yen=?, amount_due_yen=?
             WHERE id=?""",
-        (opt_price, subtotal_auto, tax, subtotal_incl, amount_due, booking_id),
+        (menu_snapshot, opt_price, subtotal_auto, tax, subtotal_incl, amount_due, booking_id),
     )
 
 
@@ -267,12 +285,13 @@ def save_booking_options(conn, booking_id: int, qty_map: Dict[int, int]):
 def compute_day_simulation(conn, day: str):
     settings = get_settings(conn)
     rows = fetch_bookings_for_day(conn, day)
-    buffer_minutes = settings["buffer_minutes"]
+    base_buffer = settings["buffer_minutes"]
+    apply_last = bool(settings["buffer_apply_to_last"])
     open_t = combine(day, settings["business_open_time"])
     close_t = combine(day, settings["business_close_time"])
 
     enriched = []
-    for r in rows:
+    for i, r in enumerate(rows):
         opts = fetch_booking_options(conn, r["id"])
         opt_minutes = sum(o["minutes_total"] for o in opts)
         menu_minutes = base_menu_minutes(conn, r["menu_type"], r["body_size"], r["coat_type"])
@@ -280,39 +299,55 @@ def compute_day_simulation(conn, day: str):
         work_minutes = menu_minutes + add45 + opt_minutes
         fixed_start = combine(day, r["fixed_start_time"])
         fixed_end_work = fixed_start + timedelta(minutes=work_minutes)
-        fixed_end_with_buffer = fixed_end_work + timedelta(minutes=buffer_minutes)
-        enriched.append({"raw": r, "work_minutes": work_minutes, "fixed_start": fixed_start,
-                         "fixed_end_work": fixed_end_work, "fixed_end_with_buffer": fixed_end_with_buffer,
-                         "opts": opts})
+
+        is_last = i == len(rows) - 1
+        base_part = base_buffer if (not is_last or apply_last) else 0
+        extra_gap = max(0, int(r["extra_gap_buffer_minutes"] or 0)) if not is_last else 0
+        applied_buffer = base_part + extra_gap
+
+        fixed_end_with_buffer = fixed_end_work + timedelta(minutes=applied_buffer)
+
+        enriched.append({
+            "raw": r,
+            "work_minutes": work_minutes,
+            "fixed_start": fixed_start,
+            "fixed_end_work": fixed_end_work,
+            "fixed_end_with_buffer": fixed_end_with_buffer,
+            "applied_buffer": applied_buffer,
+            "base_buffer": base_part,
+            "extra_gap_used": extra_gap,
+            "is_last": is_last,
+        })
 
     previous_virtual_end = open_t
     chain_level = 0
     for i, e in enumerate(enriched):
         e["virtual_start"] = max(e["fixed_start"], previous_virtual_end)
         e["virtual_end_work"] = e["virtual_start"] + timedelta(minutes=e["work_minutes"])
-        e["virtual_end_with_buffer"] = e["virtual_end_work"] + timedelta(minutes=buffer_minutes)
+        e["virtual_end_with_buffer"] = e["virtual_end_work"] + timedelta(minutes=e["applied_buffer"])
+
         intrusion = previous_virtual_end > e["fixed_start"]
-        if intrusion:
-            chain_level += 1
-        else:
-            chain_level = 0
+        chain_level = chain_level + 1 if intrusion else 0
         e["warning"] = "RED" if chain_level >= 2 else ("YELLOW" if intrusion else "GREEN")
         previous_virtual_end = e["virtual_end_with_buffer"]
 
-        if i > 0:
-            prev = enriched[i - 1]
-            gap = int((e["fixed_start"] - prev["fixed_end_work"]).total_seconds() // 60)
-            e["extra_buffer_editable"] = gap > buffer_minutes
-            e["extra_buffer_minutes"] = max(0, gap - buffer_minutes)
+        if i < len(enriched) - 1:
+            nxt = enriched[i + 1]
+            gap = int((nxt["fixed_start"] - e["fixed_end_work"]).total_seconds() // 60)
+            max_extra = max(0, gap - base_buffer)
+            e["gap_to_next"] = gap
+            e["max_extra_buffer"] = max_extra
+            e["extra_buffer_editable"] = gap > base_buffer
         else:
+            e["gap_to_next"] = None
+            e["max_extra_buffer"] = 0
             e["extra_buffer_editable"] = False
-            e["extra_buffer_minutes"] = 0
 
         e["early_virtual_start"] = None
         if i > 0:
-            prev = enriched[i - 1]["raw"]
-            if prev["actual_end_confirmed"] and prev["actual_end_time"] and e["raw"]["early_arrival_confirmed"]:
-                actual_end = combine(day, prev["actual_end_time"])
+            prev_raw = enriched[i - 1]["raw"]
+            if prev_raw["actual_end_confirmed"] and prev_raw["actual_end_time"] and e["raw"]["early_arrival_confirmed"]:
+                actual_end = combine(day, prev_raw["actual_end_time"])
                 candidate = max(actual_end, datetime.now().replace(second=0, microsecond=0))
                 if candidate < e["fixed_start"]:
                     e["early_virtual_start"] = candidate
@@ -362,12 +397,19 @@ def create_or_update_booking(conn, booking_id: Optional[int], payload: dict, opt
             tuple(payload.values()),
         )
         booking_id = cur.lastrowid
+
     save_booking_options(conn, booking_id, option_qty)
     recompute_booking(conn, booking_id)
+
     new_status = payload["payment_status"]
     if previous_status == "UNPAID" and new_status == "PAID":
-        # 将来ルールが確定するまで0または手動値を保持
+        # ポイント計算式は未確定のため、points_grantedを手動値/0で運用
         pass
+    conn.commit()
+
+
+def set_extra_gap_buffer(conn, booking_id: int, minutes: int):
+    conn.execute("UPDATE bookings SET extra_gap_buffer_minutes=? WHERE id=?", (minutes, booking_id))
     conn.commit()
 
 
@@ -421,19 +463,19 @@ def main():
 
             d1, d2, d3 = st.columns(3)
             actual_end_time = d1.text_input("実績終了時刻(HH:MM)", value=current["actual_end_time"] if current and current["actual_end_time"] else "")
-            if d1.form_submit_button("今"):
-                st.session_state["now_stamp"] = datetime.now().strftime("%H:%M")
-            if st.session_state.get("now_stamp"):
-                actual_end_time = st.session_state["now_stamp"]
             actual_confirm = d2.checkbox("作業終了確定", value=bool(current["actual_end_confirmed"]) if current else False)
             early = d3.checkbox("早め来店確認", value=bool(current["early_arrival_confirmed"]) if current else False)
 
             st.markdown("**会計**")
+            menu_snap_default = "" if not current or current["menu_unit_price_excl_tax"] is None else str(current["menu_unit_price_excl_tax"])
+            subtotal_override_default = "" if not current or current["subtotal_excl_tax_manual_override"] is None else str(current["subtotal_excl_tax_manual_override"])
+
             e1, e2, e3, e4 = st.columns(4)
-            menu_price_snapshot = e1.number_input("メニュー税抜単価", min_value=0, value=current["menu_unit_price_excl_tax"] if current and current["menu_unit_price_excl_tax"] is not None else 0)
-            manual_override = e2.number_input("税抜小計 手動上書き", min_value=0, value=current["subtotal_excl_tax_manual_override"] if current and current["subtotal_excl_tax_manual_override"] is not None else 0)
+            menu_price_snapshot_input = e1.text_input("メニュー税抜単価（任意上書き）", value=menu_snap_default, placeholder="空欄ならマスタ自動")
+            manual_override_input = e2.text_input("税抜小計 手動上書き（任意）", value=subtotal_override_default, placeholder="空欄なら自動")
             discount = e3.number_input("割引(円)", min_value=0, value=current["discount_yen"] if current else 0)
             points_used = e4.number_input("ポイント使用(円)", min_value=0, value=current["points_used_yen"] if current else 0)
+
             pay1, pay2 = st.columns(2)
             payment_status = pay1.selectbox("支払状況", ["UNPAID", "PAID"], index=["UNPAID", "PAID"].index(current["payment_status"]) if current else 0)
             points_granted = pay2.number_input("付与ポイント", min_value=0, value=current["points_granted"] if current else 0)
@@ -460,6 +502,9 @@ def main():
                 else:
                     try:
                         parse_hhmm(fixed_start)
+                        menu_snapshot = parse_optional_int(menu_price_snapshot_input)
+                        manual_override = parse_optional_int(manual_override_input)
+
                         payload = {
                             "booking_date": b_date.strftime("%Y-%m-%d"),
                             "fixed_start_time": fixed_start,
@@ -473,8 +518,8 @@ def main():
                             "actual_end_time": actual_end_time or None,
                             "actual_end_confirmed": int(actual_confirm),
                             "early_arrival_confirmed": int(early),
-                            "menu_unit_price_excl_tax": int(menu_price_snapshot),
-                            "subtotal_excl_tax_manual_override": int(manual_override) if manual_override > 0 else None,
+                            "menu_unit_price_excl_tax": menu_snapshot,
+                            "subtotal_excl_tax_manual_override": manual_override,
                             "discount_yen": int(discount),
                             "points_used_yen": int(points_used),
                             "payment_status": payment_status,
@@ -484,7 +529,7 @@ def main():
                         st.success("保存しました（開始時刻は自動移動しません）")
                         st.rerun()
                     except ValueError:
-                        st.error("時刻形式が不正です (HH:MM)")
+                        st.error("時刻形式または金額入力が不正です。")
 
         if current and st.button("この予約を削除", type="secondary"):
             conn.execute("DELETE FROM booking_options WHERE booking_id=?", (current["id"],))
@@ -495,6 +540,7 @@ def main():
     with right:
         st.subheader("結果 / タイムライン")
         view_mode = st.radio("表示", ["日別", "3ヶ月ビュー"], horizontal=True)
+
         if view_mode == "3ヶ月ビュー":
             rows = []
             for d in monthly_range(date.today()):
@@ -508,34 +554,50 @@ def main():
             sim, day_warn = compute_day_simulation(conn, day_s)
             color = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}[day_warn]
             st.markdown(f"### 当日警告: {color} {day_warn}")
+
             timeline_rows = []
             for e in sim:
                 raw = e["raw"]
-                manual = "あり" if raw["subtotal_excl_tax_manual_override"] is not None else "なし"
-                timeline_rows.append({
-                    "ID": raw["id"],
-                    "顧客": raw["customer_name"],
-                    "固定": f"{hhmm(e['fixed_start'])}-{hhmm(e['fixed_end_work'])}",
-                    "バッファ": f"{hhmm(e['fixed_end_work'])}-{hhmm(e['fixed_end_with_buffer'])}",
-                    "仮想": f"{hhmm(e['virtual_start'])}-{hhmm(e['virtual_end_work'])}",
-                    "前倒し仮想開始": hhmm(e["early_virtual_start"]) if e["early_virtual_start"] else "-",
-                    "警告": e["warning"],
-                    "作業分": e["work_minutes"],
-                    "支払額": raw["amount_due_yen"],
-                    "手動調整": manual,
-                })
+                timeline_rows.append(
+                    {
+                        "ID": raw["id"],
+                        "顧客": raw["customer_name"],
+                        "固定": f"{hhmm(e['fixed_start'])}-{hhmm(e['fixed_end_work'])}",
+                        "バッファ": f"+{e['applied_buffer']}分 (既定{e['base_buffer']}+余白{e['extra_gap_used']})",
+                        "仮想": f"{hhmm(e['virtual_start'])}-{hhmm(e['virtual_end_work'])}",
+                        "前倒し仮想開始": hhmm(e["early_virtual_start"]) if e["early_virtual_start"] else "-",
+                        "警告": e["warning"],
+                        "税抜(自動)": raw["subtotal_excl_tax_auto"],
+                        "税抜(手動上書き)": raw["subtotal_excl_tax_manual_override"] if raw["subtotal_excl_tax_manual_override"] is not None else "-",
+                        "支払額": raw["amount_due_yen"],
+                    }
+                )
             st.dataframe(pd.DataFrame(timeline_rows), use_container_width=True, hide_index=True)
             st.caption("※消費税端数切捨")
 
-            st.markdown("#### バッファ余白編集可否")
+            st.markdown("#### バッファ余白編集（空き時間 > 既定バッファ の区間のみ）")
             for i, e in enumerate(sim):
-                if i == 0:
+                if i >= len(sim) - 1:
                     continue
-                raw = e["raw"]
+                booking_id = e["raw"]["id"]
                 if e["extra_buffer_editable"]:
-                    st.info(f"予約#{raw['id']}: 追加バッファ余白 {e['extra_buffer_minutes']}分 を手動運用可能")
+                    current_extra = int(e["raw"]["extra_gap_buffer_minutes"] or 0)
+                    default_extra = min(current_extra, e["max_extra_buffer"])
+                    key = f"extra_gap_{booking_id}"
+                    value = st.number_input(
+                        f"予約#{booking_id} の余白バッファ（上限 {e['max_extra_buffer']}分）",
+                        min_value=0,
+                        max_value=e["max_extra_buffer"],
+                        value=default_extra,
+                        step=5,
+                        key=key,
+                    )
+                    if st.button(f"予約#{booking_id} の余白保存", key=f"save_extra_{booking_id}"):
+                        set_extra_gap_buffer(conn, booking_id, int(value))
+                        st.success(f"予約#{booking_id} の余白バッファを保存しました。")
+                        st.rerun()
                 else:
-                    st.write(f"予約#{raw['id']}: 後ろの予約があるため変更不可（空き<=既定バッファ）")
+                    st.write(f"予約#{booking_id}: 編集不可（空き時間 {e['gap_to_next']}分 <= 既定バッファ）")
 
             st.markdown("#### 常時ヘルプ（提案のみ）")
             if not sim:
@@ -547,6 +609,8 @@ def main():
                     st.warning("黄警告: 単発食い込み。追加オプションを減らすか、次予約開始を手動調整してください。")
                 if any(e["warning"] == "RED" for e in sim):
                     st.error("赤警告: 連鎖波及または営業時間超過。手動で開始時刻再調整か当日追加の見直しが必要です。")
+                if any(r["subtotal_excl_tax_manual_override"] is not None for r in [x["raw"] for x in sim]):
+                    st.info("手動調整あり: 一部予約で税抜小計の手動上書きが適用されています。")
                 st.write("自動で開始時刻は変更されません。確定枠を維持し、必要時のみ手動編集してください。")
 
 
