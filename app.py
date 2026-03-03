@@ -173,12 +173,19 @@ def init_db():
 def inject_compact_css():
     st.markdown("""
     <style>
+    /* 画面全体の上下余白を詰める */
     .block-container { padding-top: 0.8rem; padding-bottom: 0.8rem; }
+
+    /* 見出しを小さくして情報密度を上げる */
     h1 { font-size: 1.6rem !important; margin: 0.35rem 0 0.55rem 0 !important; }
     h2 { font-size: 1.2rem !important; margin: 0.30rem 0 0.40rem 0 !important; }
     h3 { font-size: 1.05rem !important; margin: 0.25rem 0 0.30rem 0 !important; }
+
+    /* ブロック間の隙間を詰める */
     div[data-testid="stVerticalBlock"] > div { gap: 0.35rem; }
     div[data-testid="stForm"] { padding-top: 0.2rem; }
+
+    /* ラベル類の余白を詰める */
     label, .stRadio, .stCheckbox { margin-bottom: 0.1rem !important; }
     </style>
     """, unsafe_allow_html=True)
