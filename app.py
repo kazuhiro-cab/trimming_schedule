@@ -171,22 +171,24 @@ def init_db():
 
 
 def inject_compact_css():
-    st.markdown(
-        """
-        <style>
-        h1 {font-size: 1.45rem !important; margin: 0.1rem 0 0.5rem 0 !important;}
-        h2 {font-size: 1.15rem !important; margin: 0.2rem 0 0.4rem 0 !important;}
-        h3 {font-size: 1.0rem !important; margin: 0.15rem 0 0.35rem 0 !important;}
-        .block-container {padding-top: 0.6rem !important; padding-bottom: 0.6rem !important;}
-        div[data-testid="stVerticalBlock"] > div:has(> div > .stRadio) {padding-top: 0.2rem !important; padding-bottom: 0.2rem !important;}
-        div[data-testid="stHorizontalBlock"] {gap: 0.45rem !important;}
-        div[data-testid="stForm"] {padding: 0.45rem 0.55rem !important;}
-        .stAlert {padding: 0.3rem 0.55rem !important; margin-top: 0.15rem !important; margin-bottom: 0.2rem !important;}
-        p {margin-bottom: 0.25rem !important;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("""
+<style>
+/* 全体の余白 */
+.block-container { padding-top: 1.0rem; padding-bottom: 1.0rem; }
+
+/* 見出しを小さく */
+h1 { font-size: 1.6rem !important; margin: 0.4rem 0 0.6rem 0 !important; }
+h2 { font-size: 1.2rem !important; margin: 0.4rem 0 0.4rem 0 !important; }
+h3 { font-size: 1.05rem !important; margin: 0.3rem 0 0.3rem 0 !important; }
+
+/* ウィジェット間の縦スペース */
+div[data-testid="stVerticalBlock"] > div { gap: 0.35rem; }
+div[data-testid="stForm"] { padding-top: 0.2rem; }
+
+/* ラジオ/チェックなどの余白 */
+label, .stRadio, .stCheckbox { margin-bottom: 0.1rem !important; }
+</style>
+""", unsafe_allow_html=True)
 
 
 def parse_hhmm(v: str) -> time:
